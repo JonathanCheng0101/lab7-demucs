@@ -1,12 +1,12 @@
 import os
 import sys
 import json
+import time
 import shutil
 import tempfile
 import platform
-import requests
 import subprocess
-
+import requests
 import redis
 from minio import Minio
 
@@ -22,6 +22,7 @@ MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() == "true"
 INPUT_BUCKET = os.getenv("INPUT_BUCKET", "queue")
 OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "output")
 WORK_QUEUE_KEY = os.getenv("WORK_QUEUE_KEY", "toWorker")
+LOGGING_QUEUE_KEY = os.getenv("LOGGING_QUEUE_KEY", "logging")
 
 redis_client = redis.StrictRedis(
     host=REDIS_HOST,
@@ -37,150 +38,150 @@ minio_client = Minio(
     secure=MINIO_SECURE
 )
 
-infoKey = "{}.worker.info".format(platform.node())
-debugKey = "{}.worker.debug".format(platform.node())
+infoKey = f"{platform.node()}.worker.info"
+debugKey = f"{platform.node()}.worker.debug"
 
 
-def log_debug(message, key=debugKey):
-    print("DEBUG:", message, file=sys.stdout)
+def log_info(msg):
+    print(f"INFO: {msg}", flush=True)
     try:
-        redisClient = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
-        redisClient.lpush("logging", f"{key}:{message}")
-    except Exception as exp:
-        print(f"DEBUG logging failed: {str(exp)}", file=sys.stdout)
+        redis_client.lpush(LOGGING_QUEUE_KEY, f"{infoKey}:{msg}")
+    except Exception:
+        pass
 
 
-def log_info(message, key=infoKey):
-    print("INFO:", message, file=sys.stdout)
+def log_debug(msg):
+    print(f"DEBUG: {msg}", flush=True)
     try:
-        redisClient = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
-        redisClient.lpush("logging", f"{key}:{message}")
-    except Exception as exp:
-        print(f"INFO logging failed: {str(exp)}", file=sys.stdout)
+        redis_client.lpush(LOGGING_QUEUE_KEY, f"{debugKey}:{msg}")
+    except Exception:
+        pass
 
 
-def ensure_bucket(bucket_name):
-    if not minio_client.bucket_exists(bucket_name):
-        minio_client.make_bucket(bucket_name)
-        log_info(f"Created bucket {bucket_name}")
+def ensure_bucket(name):
+    if not minio_client.bucket_exists(name):
+        minio_client.make_bucket(name)
 
 
-def maybe_call_callback(callback, songhash, status, detail=None):
+def parse_job(raw):
+    try:
+        job = json.loads(raw)
+        return {
+            "songhash": job["songhash"],
+            "input_object": job.get("input_object", f'{job["songhash"]}.mp3'),
+            "model": job.get("model", "default"),
+            "callback": job.get("callback")
+        }
+    except Exception:
+        return {
+            "songhash": raw.strip(),
+            "input_object": f"{raw.strip()}.mp3",
+            "model": "default",
+            "callback": None
+        }
+
+
+def find_track_dir(output_root):
+    needed = {"bass.mp3", "drums.mp3", "vocals.mp3", "other.mp3"}
+    for root, _, files in os.walk(output_root):
+        if needed.issubset(set(files)):
+            return root
+    return None
+
+
+def callback_post(callback, songhash, status, detail=None, tracks=None):
     if not callback:
         return
-
+    payload = {"songhash": songhash, "status": status}
+    if detail:
+        payload["detail"] = detail
+    if tracks:
+        payload["tracks"] = tracks
     try:
-        payload = {
-            "hash": songhash,
-            "status": status
-        }
-        if detail is not None:
-            payload["detail"] = detail
-
         if isinstance(callback, str):
-            requests.post(callback, json=payload, timeout=5)
+            requests.post(callback, json=payload, timeout=10)
         elif isinstance(callback, dict) and "url" in callback:
-            callback_payload = callback.get("payload", {})
-            callback_payload.update(payload)
-            requests.post(callback["url"], json=callback_payload, timeout=5)
-
-        log_info(f"Callback attempted for {songhash} with status {status}")
-    except Exception as exp:
-        log_debug(f"Callback failed for {songhash}: {str(exp)}")
+            extra = callback.get("payload", {})
+            extra.update(payload)
+            requests.post(callback["url"], json=extra, timeout=10)
+    except Exception as e:
+        log_debug(f"callback failed: {e}")
 
 
-def process_song(songhash: str, model: str = "default", callback=None):
-    log_info(f"Processing songhash={songhash} model={model}")
-
+def process_song(songhash, input_object, model="default", callback=None):
     workdir = tempfile.mkdtemp(prefix=f"demucs-{songhash}-")
     try:
         input_path = os.path.join(workdir, f"{songhash}.mp3")
         output_root = os.path.join(workdir, "output")
         os.makedirs(output_root, exist_ok=True)
 
-        log_info(f"Downloading input object {INPUT_BUCKET}/{songhash}.mp3")
-        minio_client.fget_object(INPUT_BUCKET, f"{songhash}.mp3", input_path)
+        log_info(f"downloading {INPUT_BUCKET}/{input_object}")
+        minio_client.fget_object(INPUT_BUCKET, input_object, input_path)
 
-        cmd = [
-            "python3", "-m", "demucs.separate",
-            "--mp3",
-            "--out", output_root,
-            input_path
-        ]
-        log_info(f"Running demucs for {songhash}")
+        cmd = ["python3", "-m", "demucs.separate", "--mp3"]
+        if model and model != "default":
+            cmd += ["-n", model]
+        cmd += ["--out", output_root, input_path]
+
+        log_info("running demucs")
         result = subprocess.run(cmd, capture_output=True, text=True)
+        log_debug(result.stdout)
+        log_debug(result.stderr)
 
         if result.returncode != 0:
             raise RuntimeError(f"demucs failed: {result.stderr}")
 
-        model_dirs = [
-            d for d in os.listdir(output_root)
-            if os.path.isdir(os.path.join(output_root, d))
-        ]
-        if not model_dirs:
-            raise RuntimeError("No model output directory found")
+        track_dir = find_track_dir(output_root)
+        if not track_dir:
+            raise RuntimeError("no output tracks found")
 
-        model_dir = os.path.join(output_root, model_dirs[0], songhash)
-        if not os.path.isdir(model_dir):
-            raise RuntimeError(f"Expected output directory not found: {model_dir}")
-
+        tracks = {}
         for track in ["bass.mp3", "drums.mp3", "vocals.mp3", "other.mp3"]:
-            local_track_path = os.path.join(model_dir, track)
-            if not os.path.exists(local_track_path):
-                raise RuntimeError(f"Missing output track: {local_track_path}")
+            local_path = os.path.join(track_dir, track)
+            if not os.path.exists(local_path):
+                raise RuntimeError(f"missing {track}")
 
-            object_name = f"{songhash}-{track}"
+            object_name = f"{songhash}/{track}"
             minio_client.fput_object(
                 OUTPUT_BUCKET,
                 object_name,
-                local_track_path,
+                local_path,
                 content_type="audio/mpeg"
             )
-            log_info(f"Uploaded output track {object_name}")
+            tracks[track.replace(".mp3", "")] = object_name
+            log_info(f"uploaded {OUTPUT_BUCKET}/{object_name}")
 
-        log_info(f"Finished processing {songhash}")
-        maybe_call_callback(callback, songhash, "completed")
+        callback_post(callback, songhash, "completed", tracks=tracks)
+        log_info(f"done {songhash}")
 
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-        log_debug(f"Cleaned temporary directory for {songhash}")
 
 
 def main():
-    ensure_bucket(INPUT_BUCKET)
     ensure_bucket(OUTPUT_BUCKET)
-
-    log_info("Worker started and waiting for jobs")
+    log_info("worker started")
 
     while True:
         try:
-            item = redis_client.brpop(WORK_QUEUE_KEY, timeout=0)
-            if not item:
-                continue
-
-            queue_name, raw_job = item
-            log_debug(f"Received raw job from {queue_name}: {raw_job}")
+            _, raw = redis_client.brpop(WORK_QUEUE_KEY, timeout=0)
+            log_debug(f"job: {raw}")
+            job = parse_job(raw)
 
             try:
-                job = json.loads(raw_job)
-                songhash = job["songhash"]
-                model = job.get("model", "default")
-                callback = job.get("callback")
-            except Exception:
-                songhash = raw_job
-                model = "default"
-                callback = None
+                process_song(
+                    songhash=job["songhash"],
+                    input_object=job["input_object"],
+                    model=job["model"],
+                    callback=job["callback"]
+                )
+            except Exception as e:
+                log_debug(f"failed {job['songhash']}: {e}")
+                callback_post(job["callback"], job["songhash"], "failed", detail=str(e))
 
-            log_info(f"Dequeued job for {songhash}")
-
-            try:
-                process_song(songhash, model=model, callback=callback)
-            except Exception as exp:
-                log_debug(f"Failed processing {songhash}: {str(exp)}")
-                maybe_call_callback(callback, songhash, "failed", str(exp))
-
-        except Exception as exp:
-            log_debug(f"Exception in worker loop: {str(exp)}")
+        except Exception as e:
+            log_debug(f"loop error: {e}")
+            time.sleep(2)
 
 
 if __name__ == "__main__":
