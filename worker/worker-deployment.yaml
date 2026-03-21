@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+        - name: worker
+          image: us-central1-docker.pkg.dev/halogen-acumen-484522-c6/lab7-repo/worker:v1
+          env:
+            - name: REDIS_HOST
+              value: "redis"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_DB
+              value: "0"
+
+            - name: MINIO_ENDPOINT
+              value: "minio:9000"
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: accesskey
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: secretkey
+            - name: MINIO_SECURE
+              value: "false"
+
+            - name: INPUT_BUCKET
+              value: "queue"
+            - name: OUTPUT_BUCKET
+              value: "output"
+
+            - name: WORK_QUEUE_KEY
+              value: "toWorker"
+            - name: LOGGING_QUEUE_KEY
+              value: "logging"
