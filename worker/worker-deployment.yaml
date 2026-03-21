@@ -47,8 +47,8 @@ spec:
               value: "logging"
           resources:
             requests:
-              memory: "6Gi"
-              cpu: "1"
+              memory: "2Gi"
+              cpu: "500m"
             limits:
-              memory: "8Gi"
-              cpu: "2"
+              memory: "4Gi"
+              cpu: "1"
