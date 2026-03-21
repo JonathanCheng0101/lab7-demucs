@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
       - name: rest
-        image: us-central1-docker.pkg.dev/halogen-acumen-484522-c6/lab7-repo/rest:v1
+        image: us-central1-docker.pkg.dev/halogen-acumen-484522-c6/lab7-repo/rest:v2
         imagePullPolicy: Always
         ports:
         - containerPort: 5000
@@ -35,3 +35,5 @@ spec:
             secretKeyRef:
               name: minio-credentials
               key: secretkey
+        - name: REST_CALLBACK_URL
+          value: "http://rest:5000/apiv1/callback"

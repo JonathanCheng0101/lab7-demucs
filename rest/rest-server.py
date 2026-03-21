@@ -32,6 +32,8 @@ minio_client = Minio(
 INPUT_BUCKET = "queue"
 OUTPUT_BUCKET = "output"
 WORK_QUEUE_KEY = "toWorker"
+CALLBACK_LOG_KEY = "completedCallbacks"
+REST_CALLBACK_URL = os.getenv("REST_CALLBACK_URL", "http://rest:5000/apiv1/callback")
 
 ALLOWED_TRACKS = {"base.mp3", "bass.mp3", "vocals.mp3", "drums.mp3", "other.mp3"}
 
@@ -42,8 +44,7 @@ debugKey = "{}.rest.debug".format(platform.node())
 def log_debug(message, key=debugKey):
     print("DEBUG:", message, file=sys.stdout)
     try:
-        redisClient = redis.StrictRedis(host=redisHost, port=redisPort, db=0, decode_responses=True)
-        redisClient.lpush("logging", f"{key}:{message}")
+        redis_client.lpush("logging", f"{key}:{message}")
     except Exception as exp:
         print(f"DEBUG logging failed: {str(exp)}", file=sys.stdout)
 
@@ -51,8 +52,7 @@ def log_debug(message, key=debugKey):
 def log_info(message, key=infoKey):
     print("INFO:", message, file=sys.stdout)
     try:
-        redisClient = redis.StrictRedis(host=redisHost, port=redisPort, db=0, decode_responses=True)
-        redisClient.lpush("logging", f"{key}:{message}")
+        redis_client.lpush("logging", f"{key}:{message}")
     except Exception as exp:
         print(f"INFO logging failed: {str(exp)}", file=sys.stdout)
 
@@ -68,6 +68,24 @@ def hello():
     return "<h1>Music Separation Server</h1><p>Use a valid endpoint</p>"
 
 
+@app.route("/apiv1/callback", methods=["POST"])
+def callback():
+    """
+    Worker finishes processing and POSTs callback data here.
+    We log it and store it in Redis for inspection.
+    """
+    data = request.get_json(silent=True) or {}
+    songhash = data.get("songhash", "unknown")
+
+    try:
+        redis_client.hset(CALLBACK_LOG_KEY, songhash, json.dumps(data))
+        log_info(f"Received callback for {songhash}: {json.dumps(data)}")
+        return jsonify({"status": "ok", "songhash": songhash}), 200
+    except Exception as exp:
+        log_debug(f"Callback processing failed: {str(exp)}")
+        return jsonify({"error": str(exp)}), 500
+
+
 @app.route("/apiv1/separate", methods=["POST"])
 def separate():
     data = request.get_json(silent=True)
@@ -77,7 +95,12 @@ def separate():
 
     mp3_b64 = data["mp3"]
     model = data.get("model", "default")
-    callback = data.get("callback")
+
+    incoming_callback = data.get("callback", {})
+    if isinstance(incoming_callback, dict):
+        callback_data = incoming_callback.get("data", {})
+    else:
+        callback_data = {}
 
     try:
         mp3_bytes = base64.b64decode(mp3_b64)
@@ -87,6 +110,15 @@ def separate():
 
     songhash = hashlib.sha224(mp3_bytes).hexdigest()
     log_info(f"Received separation request for {songhash}")
+
+    callback = {
+        "url": REST_CALLBACK_URL,
+        "data": {
+            "songhash": songhash,
+            "model": model,
+            **callback_data
+        }
+    }
 
     try:
         ensure_bucket(INPUT_BUCKET)
@@ -106,13 +138,15 @@ def separate():
             "model": model,
             "callback": callback
         }
+
         redis_client.lpush(WORK_QUEUE_KEY, json.dumps(job))
         log_info(f"Enqueued work item for {songhash} on queue {WORK_QUEUE_KEY}")
 
         return jsonify({
             "hash": songhash,
-            "reason": "Song enqueued for separation"
-        })
+            "reason": "Song enqueued for separation",
+            "callback_url": REST_CALLBACK_URL
+        }), 200
 
     except Exception as exp:
         log_debug(f"Error in /apiv1/separate for {songhash}: {str(exp)}")
@@ -130,26 +164,38 @@ def queue():
         return jsonify({"error": str(exp)}), 500
 
 
+@app.route("/apiv1/callbacks", methods=["GET"])
+def callbacks():
+    try:
+        items = redis_client.hgetall(CALLBACK_LOG_KEY)
+        return jsonify(items), 200
+    except Exception as exp:
+        log_debug(f"Callback inspection failed: {str(exp)}")
+        return jsonify({"error": str(exp)}), 500
+
+
 @app.route("/apiv1/track/<songhash>/<track>", methods=["GET"])
 def track(songhash, track):
     if track not in ALLOWED_TRACKS:
         log_debug(f"Invalid track requested: {track}")
         return jsonify({"error": "invalid track"}), 400
 
+    object_name = f"{songhash}/{track}"
+
     try:
-        obj = minio_client.get_object(OUTPUT_BUCKET, f"{songhash}-{track}")
+        obj = minio_client.get_object(OUTPUT_BUCKET, object_name)
         data = obj.read()
         obj.close()
         obj.release_conn()
 
-        log_info(f"Returned track {songhash}-{track}")
+        log_info(f"Returned track {object_name}")
         return Response(
             data,
             mimetype="audio/mpeg",
             headers={"Content-Disposition": f'attachment; filename="{track}"'}
         )
     except Exception as exp:
-        log_debug(f"Track retrieval failed for {songhash}-{track}: {str(exp)}")
+        log_debug(f"Track retrieval failed for {object_name}: {str(exp)}")
         return jsonify({"error": "track not found"}), 404
 
 
@@ -159,12 +205,14 @@ def remove(songhash, track):
         log_debug(f"Invalid track removal requested: {track}")
         return jsonify({"error": "invalid track"}), 400
 
+    object_name = f"{songhash}/{track}"
+
     try:
-        minio_client.remove_object(OUTPUT_BUCKET, f"{songhash}-{track}")
-        log_info(f"Removed track {songhash}-{track}")
-        return jsonify({"removed": f"{songhash}/{track}"})
+        minio_client.remove_object(OUTPUT_BUCKET, object_name)
+        log_info(f"Removed track {object_name}")
+        return jsonify({"removed": object_name}), 200
     except Exception as exp:
-        log_debug(f"Track removal failed for {songhash}-{track}: {str(exp)}")
+        log_debug(f"Track removal failed for {object_name}: {str(exp)}")
         return jsonify({"error": "track not found"}), 404
 
 
