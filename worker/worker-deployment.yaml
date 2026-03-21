@@ -14,7 +14,9 @@ spec:
     spec:
       containers:
         - name: worker
-          image: us-central1-docker.pkg.dev/halogen-acumen-484522-c6/lab7-repo/worker:v1
+          image: us-central1-docker.pkg.dev/halogen-acumen-484522-c6/lab7-repo/worker:v2
+          imagePullPolicy: Always
+          command: ["python3", "/app/worker-server.py"]
           env:
             - name: REDIS_HOST
               value: "redis"
