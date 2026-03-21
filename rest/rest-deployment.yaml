@@ -26,6 +26,12 @@ spec:
         - name: MINIO_ENDPOINT
           value: "minio:9000"
         - name: MINIO_ACCESS_KEY
-          value: "rootuser"
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: accesskey
         - name: MINIO_SECRET_KEY
-          value: "rootpass123"
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: secretkey
